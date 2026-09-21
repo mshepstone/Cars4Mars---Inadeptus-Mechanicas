@@ -207,7 +207,8 @@ def create_app(broker, state, camera, mission_controller=None):
 
     trainer = VenueTrainer(
         Path(broker.save_dir) / "venue-train",
-        object_mission=object_mission
+        object_mission=object_mission,
+        state=state
     )
 
     @app.get("/", response_class=HTMLResponse)
@@ -277,6 +278,12 @@ def create_app(broker, state, camera, mission_controller=None):
                 "balloon_detected": state.balloon_detected,
                 "balloon_class": state.balloon_class,
                 "source": getattr(camera, "active_mode", None),
+                "ui_mode": getattr(state, "ui_mode", "live"),
+                "detection_enabled": getattr(
+                    state,
+                    "detection_enabled",
+                    True
+                ),
                 "monitor": None,
                 "last_archive": broker.last_archive_name,
                 "frame_count": broker.frame_count,
@@ -290,6 +297,23 @@ def create_app(broker, state, camera, mission_controller=None):
             payload["monitor"] = camera.camera.monitor_index
 
         return JSONResponse(payload)
+
+    @app.post("/api/ui-mode/{mode}")
+    def set_ui_mode(mode: str):
+        mode = mode.lower()
+
+        if mode not in ("live", "train"):
+            return json_error("Mode must be live or train.")
+
+        with state.lock:
+            state.ui_mode = mode
+
+        detection_enabled = trainer.refresh_detection()
+
+        return JSONResponse({
+            "ui_mode": mode,
+            "detection_enabled": detection_enabled
+        })
 
     @app.get("/api/captures")
     def captures():

@@ -375,6 +375,8 @@
       if (name === "train") {
         refreshTrain();
       }
+
+      fetch("/api/ui-mode/" + name, { method: "POST" });
     }
 
     document.getElementById("tab-live").addEventListener("click", () => showPage("live"));

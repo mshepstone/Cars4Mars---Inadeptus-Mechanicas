@@ -473,14 +473,28 @@ def vision_loop(state, stop_event, camera, mission_controller, frame_broker=None
 
             continue
 
+        with state.lock:
+            detecting = getattr(state, "detection_enabled", True)
+
         # Keep a copy without detection overlays for venue training.
         raw_frame = frame.copy()
 
-        # ----------------------------------------------------
-        # Process frame through MissionController
-        # ----------------------------------------------------
+        # Train mode skips YOLO / balloon inference so the
+        # camera is only used for grab-live snapshots.
+        if not detecting:
+            with state.lock:
+                state.frame = raw_frame.copy()
+                state.raw_frame = raw_frame
+                state.distance_cm = distance
+                state.ball_detected = False
+                state.object_class = None
+                state.object_direction = None
+                state.balloon_detected = False
+                state.balloon_class = None
+                state.balloon_detections = []
 
-        result = mission_controller.process_frame(frame)
+            time.sleep(0.2)
+            continue
 
         # ----------------------------------------------------
         # Get object-mission result
