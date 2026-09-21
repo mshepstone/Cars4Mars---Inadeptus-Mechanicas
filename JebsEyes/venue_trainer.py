@@ -40,7 +40,7 @@ class VenueTrainer:
     Overfitting on a handful of camera shots is intentional.
     """
 
-    def __init__(self, root_dir, object_mission=None):
+    def __init__(self, root_dir, object_mission=None, state=None):
         self.root = Path(root_dir)
         self.images_dir = self.root / "images"
         self.labels_dir = self.root / "labels"
@@ -48,6 +48,7 @@ class VenueTrainer:
         self.runs_dir = self.root / "runs"
         self.session_path = self.root / "session.json"
         self.object_mission = object_mission
+        self.state = state
 
         self.images_dir.mkdir(parents=True, exist_ok=True)
         self.labels_dir.mkdir(parents=True, exist_ok=True)
@@ -67,6 +68,25 @@ class VenueTrainer:
             "applied": None
         }
         self._train_thread = None
+
+    def refresh_detection(self):
+        """
+        Turn live object detection off while the Train page
+        is open or a fine-tune job is running.
+        """
+
+        if self.state is None:
+            return False
+
+        with self.lock:
+            training = self.job.get("status") == "running"
+
+        with self.state.lock:
+            on_train_page = self.state.ui_mode == "train"
+            self.state.detection_enabled = (
+                (not on_train_page) and (not training)
+            )
+            return self.state.detection_enabled
 
     def _load_session(self):
         if self.session_path.exists():
@@ -284,7 +304,8 @@ class VenueTrainer:
             )
             self._train_thread.start()
 
-            return dict(self.job)
+        self.refresh_detection()
+        return dict(self.job)
 
     def _run_train(self, class_name, labelled, epochs):
         try:
@@ -364,6 +385,9 @@ class VenueTrainer:
                     timespec="seconds"
                 )
             self._log(f"Training failed: {error}")
+
+        finally:
+            self.refresh_detection()
 
     def _build_yolo_dataset(self, class_name, labelled):
         if self.yolo_dir.exists():
