@@ -497,6 +497,12 @@ def vision_loop(state, stop_event, camera, mission_controller, frame_broker=None
             continue
 
         # ----------------------------------------------------
+        # Process frame through MissionController
+        # ----------------------------------------------------
+
+        result = mission_controller.process_frame(frame)
+
+        # ----------------------------------------------------
         # Get object-mission result
         # ----------------------------------------------------
 
