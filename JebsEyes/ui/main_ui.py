@@ -60,7 +60,8 @@ class RoverUI:
         self.web_server, self.viewer_urls = start_web_viewer(
             self.frame_broker,
             self.state,
-            self.camera
+            self.camera,
+            self.mission_controller
         )
 
         self.root.after(

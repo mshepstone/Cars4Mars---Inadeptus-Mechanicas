@@ -20,6 +20,8 @@ class RobotState:
         # =================================================
 
         self.frame = None
+        # Camera frame before detection overlays are drawn.
+        self.raw_frame = None
 
         # Tennis ball
         self.ball_detected = False

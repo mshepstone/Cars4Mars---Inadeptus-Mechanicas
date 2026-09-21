@@ -473,6 +473,9 @@ def vision_loop(state, stop_event, camera, mission_controller, frame_broker=None
 
             continue
 
+        # Keep a copy without detection overlays for venue training.
+        raw_frame = frame.copy()
+
         # ----------------------------------------------------
         # Process frame through MissionController
         # ----------------------------------------------------
@@ -505,6 +508,7 @@ def vision_loop(state, stop_event, camera, mission_controller, frame_broker=None
             # ------------------------------------------------
 
             state.frame = frame.copy()
+            state.raw_frame = raw_frame
 
             # ------------------------------------------------
             # Distance

@@ -6,17 +6,39 @@ from datetime import datetime
 from pathlib import Path
 
 import cv2
-from fastapi import FastAPI
+from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import (
     HTMLResponse,
     JSONResponse,
     Response,
     StreamingResponse
 )
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+
+from JebsEyes.venue_trainer import VenueTrainer
 
 
 WEB_HOST = "0.0.0.0"
 WEB_PORT = 8000
+UI_DIR = Path(__file__).resolve().parent
+HTML_PATH = UI_DIR / "web_page.html"
+
+
+class BoxBody(BaseModel):
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+
+
+class ClassBody(BaseModel):
+    class_name: str
+
+
+class TrainBody(BaseModel):
+    class_name: str | None = None
+    epochs: int = Field(default=15, ge=1, le=80)
 
 
 class AnnotatedFrameBroker:
@@ -43,6 +65,21 @@ class AnnotatedFrameBroker:
         self.last_archive = 0.0
         self.last_archive_name = None
         self.frame_count = 0
+        self.archiving = False
+
+    def set_archiving(self, enabled):
+        with self.lock:
+            self.archiving = bool(enabled)
+
+            if self.archiving:
+                # Save the next frame immediately after Start.
+                self.last_archive = 0.0
+
+        return self.archiving
+
+    def is_archiving(self):
+        with self.lock:
+            return self.archiving
 
     def publish(self, frame):
         ok, buffer = cv2.imencode(
@@ -59,9 +96,13 @@ class AnnotatedFrameBroker:
         with self.lock:
             self.jpeg = jpeg
             self.frame_count += 1
+            archiving = self.archiving
 
         latest_path = self.save_dir / "latest.jpg"
         latest_path.write_bytes(jpeg)
+
+        if not archiving:
+            return
 
         now = time.monotonic()
 
@@ -137,21 +178,65 @@ def viewer_urls():
     }
 
 
-def create_app(broker, state, camera):
+def render_page(start="live"):
+    html = HTML_PATH.read_text(encoding="utf-8")
+    return html.replace(
+        'data-start="live"',
+        f'data-start="{start}"',
+        1
+    )
+
+
+def json_error(message, status_code=400):
+    return JSONResponse(
+        {"error": message},
+        status_code=status_code
+    )
+
+
+def create_app(broker, state, camera, mission_controller=None):
     app = FastAPI(title="Jeb Annotated Feed")
+
+    object_mission = None
+    if mission_controller is not None:
+        object_mission = getattr(
+            mission_controller,
+            "object_mission",
+            None
+        )
+
+    trainer = VenueTrainer(
+        Path(broker.save_dir) / "venue-train",
+        object_mission=object_mission
+    )
 
     @app.get("/", response_class=HTMLResponse)
     def index():
-        return HTML_PAGE
+        return render_page("live")
+
+    @app.get("/train", response_class=HTMLResponse)
+    def train_page():
+        return render_page("train")
 
     @app.get("/api/latest.jpg")
     def latest_jpg():
         jpeg = broker.get_jpeg()
 
         if jpeg is None:
-            return Response(status_code=204)
+            return Response(
+                status_code=204,
+                headers={
+                    "Cache-Control": "no-cache, no-store, must-revalidate"
+                }
+            )
 
-        return Response(content=jpeg, media_type="image/jpeg")
+        return Response(
+            content=jpeg,
+            media_type="image/jpeg",
+            headers={
+                "Cache-Control": "no-cache, no-store, must-revalidate"
+            }
+        )
 
     @app.get("/api/stream")
     async def stream():
@@ -171,7 +256,12 @@ def create_app(broker, state, camera):
 
         return StreamingResponse(
             generate(),
-            media_type="multipart/x-mixed-replace; boundary=frame"
+            media_type="multipart/x-mixed-replace; boundary=frame",
+            headers={
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+                "Connection": "keep-alive"
+            }
         )
 
     @app.get("/api/status")
@@ -189,7 +279,8 @@ def create_app(broker, state, camera):
                 "source": getattr(camera, "active_mode", None),
                 "monitor": None,
                 "last_archive": broker.last_archive_name,
-                "frame_count": broker.frame_count
+                "frame_count": broker.frame_count,
+                "archiving": broker.is_archiving()
             }
 
         if (
@@ -203,6 +294,20 @@ def create_app(broker, state, camera):
     @app.get("/api/captures")
     def captures():
         return JSONResponse(broker.list_archives())
+
+    @app.post("/api/archive/start")
+    def start_archive():
+        return JSONResponse({
+            "ok": True,
+            "archiving": broker.set_archiving(True)
+        })
+
+    @app.post("/api/archive/stop")
+    def stop_archive():
+        return JSONResponse({
+            "ok": True,
+            "archiving": broker.set_archiving(False)
+        })
 
     @app.post("/api/save")
     def save():
@@ -248,7 +353,84 @@ def create_app(broker, state, camera):
             "monitor": camera.camera.monitor_index
         })
 
-    from fastapi.staticfiles import StaticFiles
+    @app.get("/api/train/session")
+    def train_session():
+        return JSONResponse(trainer.get_session())
+
+    @app.put("/api/train/class")
+    def train_class(payload: ClassBody):
+        try:
+            class_name = trainer.set_class_name(payload.class_name)
+            return JSONResponse({"class_name": class_name})
+        except ValueError as error:
+            return json_error(str(error))
+
+    @app.post("/api/train/images")
+    async def upload_images(files: list[UploadFile] = File(...)):
+        added = []
+
+        try:
+            for upload in files:
+                data = await upload.read()
+                added.append(
+                    trainer.add_image_from_bytes(
+                        data,
+                        upload.filename or "upload.jpg"
+                    )
+                )
+        except ValueError as error:
+            return json_error(str(error))
+
+        return JSONResponse({"images": added})
+
+    @app.post("/api/train/grab-live")
+    def grab_live():
+        with state.lock:
+            frame = getattr(state, "raw_frame", None)
+            if frame is not None:
+                frame = frame.copy()
+
+        if frame is None:
+            return json_error("No live camera frame yet.", 409)
+
+        try:
+            return JSONResponse(trainer.add_image_from_frame(frame))
+        except ValueError as error:
+            return json_error(str(error))
+
+    @app.put("/api/train/images/{image_id}/box")
+    def set_box(image_id: str, payload: BoxBody):
+        try:
+            return JSONResponse(
+                trainer.set_box(
+                    image_id,
+                    [payload.x1, payload.y1, payload.x2, payload.y2]
+                )
+            )
+        except KeyError:
+            return json_error("Image not found.", 404)
+        except ValueError as error:
+            return json_error(str(error))
+
+    @app.delete("/api/train/images/{image_id}")
+    def delete_image(image_id: str):
+        try:
+            trainer.delete_image(image_id)
+            return JSONResponse({"ok": True})
+        except KeyError:
+            return json_error("Image not found.", 404)
+
+    @app.post("/api/train/start")
+    def start_train(payload: TrainBody):
+        try:
+            return JSONResponse(
+                trainer.start_train(
+                    class_name=payload.class_name,
+                    epochs=payload.epochs
+                )
+            )
+        except (ValueError, RuntimeError) as error:
+            return json_error(str(error))
 
     app.mount(
         "/captures",
@@ -256,13 +438,24 @@ def create_app(broker, state, camera):
         name="captures"
     )
 
+    app.mount(
+        "/venue",
+        StaticFiles(directory=str(trainer.root)),
+        name="venue"
+    )
+
     return app
 
 
-def start_web_viewer(broker, state, camera):
+def start_web_viewer(broker, state, camera, mission_controller=None):
     import uvicorn
 
-    app = create_app(broker, state, camera)
+    app = create_app(
+        broker,
+        state,
+        camera,
+        mission_controller
+    )
     config = uvicorn.Config(
         app,
         host=WEB_HOST,
@@ -289,196 +482,3 @@ def start_web_viewer(broker, state, camera):
     print()
 
     return server, urls
-
-
-HTML_PAGE = """<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Jeb Annotated FPV</title>
-  <style>
-    :root {
-      --bg: #101418;
-      --panel: #1b2128;
-      --line: #2d3844;
-      --text: #e8eef4;
-      --muted: #93a1b0;
-      --accent: #3dd68c;
-      --warn: #ffb020;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      font-family: "Segoe UI", sans-serif;
-      background: var(--bg);
-      color: var(--text);
-    }
-    header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 16px;
-      padding: 16px 22px;
-      border-bottom: 1px solid var(--line);
-      background: var(--panel);
-    }
-    h1 {
-      margin: 0;
-      font-size: 20px;
-    }
-    .sub { color: var(--muted); font-size: 13px; margin-top: 4px; }
-    .actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-    button, select {
-      background: #24303b;
-      color: var(--text);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 8px 12px;
-      cursor: pointer;
-    }
-    button:hover { border-color: var(--accent); }
-    main {
-      display: grid;
-      grid-template-columns: 1fr 320px;
-      gap: 16px;
-      padding: 16px;
-    }
-    .feed {
-      background: #000;
-      border: 1px solid var(--line);
-      border-radius: 12px;
-      min-height: 360px;
-      overflow: hidden;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-    }
-    .feed img { width: 100%; display: block; }
-    .side { display: flex; flex-direction: column; gap: 12px; }
-    .card {
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 12px;
-      padding: 14px;
-    }
-    .chips { display: flex; flex-wrap: wrap; gap: 8px; }
-    .chip {
-      border-radius: 999px;
-      padding: 4px 10px;
-      font-size: 12px;
-      background: #24303b;
-      color: var(--muted);
-    }
-    .chip.on { background: #163527; color: var(--accent); }
-    .grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 8px;
-    }
-    .grid img {
-      width: 100%;
-      border-radius: 8px;
-      border: 1px solid var(--line);
-    }
-    .note { color: var(--warn); font-size: 12px; line-height: 1.4; }
-    @media (max-width: 900px) {
-      main { grid-template-columns: 1fr; }
-    }
-  </style>
-</head>
-<body>
-  <header>
-    <div>
-      <h1>Jeb annotated FPV</h1>
-      <div class="sub">Live screen capture with object overlays</div>
-    </div>
-    <div class="actions">
-      <select id="monitor"></select>
-      <button id="save">Save screenshot</button>
-    </div>
-  </header>
-  <main>
-    <section class="feed">
-      <img id="live" src="/api/stream" alt="Annotated live feed">
-    </section>
-    <aside class="side">
-      <div class="card">
-        <div class="chips">
-          <span class="chip" id="mode">MODE</span>
-          <span class="chip" id="mission">MISSION</span>
-          <span class="chip" id="source">SOURCE</span>
-          <span class="chip" id="ball">BALL</span>
-          <span class="chip" id="object">OBJECT</span>
-        </div>
-      </div>
-      <div class="card note">
-        If this page is on the same monitor you are capturing,
-        open it on another screen so Jeb does not annotate itself.
-      </div>
-      <div class="card">
-        <div class="sub" id="last-save">No screenshots yet</div>
-        <div class="grid" id="gallery"></div>
-      </div>
-    </aside>
-  </main>
-  <script>
-    async function refreshStatus() {
-      const res = await fetch("/api/status");
-      const data = await res.json();
-      setChip("mode", data.control_mode, true);
-      setChip("mission", data.mission, true);
-      setChip("source", data.source || "none", !!data.source);
-      setChip("ball", data.ball_detected ? "BALL YES" : "BALL NO", data.ball_detected);
-      setChip("object", data.object_class || "NO OBJECT", !!data.object_class);
-      if (data.last_archive) {
-        document.getElementById("last-save").textContent =
-          "Last saved: " + data.last_archive;
-      }
-    }
-
-    function setChip(id, text, on) {
-      const el = document.getElementById(id);
-      el.textContent = text;
-      el.classList.toggle("on", on);
-    }
-
-    async function refreshGallery() {
-      const res = await fetch("/api/captures");
-      const items = await res.json();
-      const gallery = document.getElementById("gallery");
-      gallery.innerHTML = items.map(item =>
-        `<a href="${item.url}" target="_blank">
-           <img src="${item.url}" alt="${item.name}">
-         </a>`
-      ).join("");
-    }
-
-    async function loadMonitors() {
-      const res = await fetch("/api/monitors");
-      const monitors = await res.json();
-      const select = document.getElementById("monitor");
-      select.innerHTML = monitors.map(monitor =>
-        `<option value="${monitor.id}">${monitor.label} (${monitor.width}x${monitor.height})</option>`
-      ).join("");
-    }
-
-    document.getElementById("monitor").addEventListener("change", async (event) => {
-      await fetch("/api/monitor/" + event.target.value, { method: "POST" });
-    });
-
-    document.getElementById("save").addEventListener("click", async () => {
-      await fetch("/api/save", { method: "POST" });
-      refreshGallery();
-      refreshStatus();
-    });
-
-    loadMonitors();
-    refreshStatus();
-    refreshGallery();
-    setInterval(refreshStatus, 1000);
-    setInterval(refreshGallery, 4000);
-  </script>
-</body>
-</html>
-"""

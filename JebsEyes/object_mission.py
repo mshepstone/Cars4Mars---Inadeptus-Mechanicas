@@ -99,6 +99,31 @@ class ObjectMission:
 
         print("Object mission initialized.")
 
+    def load_venue_weights(self, class_name, weights_path):
+        """
+        Reload a detector with weights fine-tuned on venue photos.
+        """
+
+        name = class_name.strip().lower().replace(" ", "_")
+
+        if name == "hammer":
+            self.hammer_detector = HammerDetector(
+                model_path=weights_path
+            )
+            return "Hammer detector now uses the venue-trained weights."
+
+        if name in ("cone", "traffic_cone"):
+            self.cone_detector = ConeDetector(
+                model_path=weights_path
+            )
+            return "Cone detector now uses the venue-trained weights."
+
+        return (
+            f"Weights saved for '{class_name}'. "
+            "Live Detect still uses the existing detectors "
+            "until this class is wired in."
+        )
+
     # =====================================================
     # TENNIS BALL DETECTION
     # =====================================================
